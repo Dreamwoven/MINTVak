@@ -339,6 +339,10 @@ pub struct Config {
     pub drg_pak_path: Option<PathBuf>,
     pub gui_theme: Option<GuiTheme>,
     pub sorting_config: Option<SortingConfig>,
+    #[serde(default = "default_true")]
+    pub confirm_mod_deletion: bool,
+    #[serde(default = "default_true")]
+    pub confirm_profile_deletion: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -413,6 +417,8 @@ impl Default for Config!["0.0.0"] {
                 .map(DRGInstallation::main_pak),
             gui_theme: None,
             sorting_config: None,
+            confirm_mod_deletion: true,
+            confirm_profile_deletion: true,
         }
     }
 }

@@ -1110,6 +1110,24 @@ impl App {
                         });
                         ui.end_row();
 
+                        ui.label("Confirm mod deletion:");
+                        if ui.checkbox(&mut self.state.config.confirm_mod_deletion, "")
+                            .on_hover_text("Show confirmation dialog before deleting mods")
+                            .changed()
+                        {
+                            self.state.config.save().unwrap();
+                        }
+                        ui.end_row();
+
+                        ui.label("Confirm profile deletion:");
+                        if ui.checkbox(&mut self.state.config.confirm_profile_deletion, "")
+                            .on_hover_text("Show confirmation dialog before deleting profiles")
+                            .changed()
+                        {
+                            self.state.config.save().unwrap();
+                        }
+                        ui.end_row();
+
                         ui.label("Mod providers:");
                         ui.end_row();
 
@@ -1155,6 +1173,18 @@ impl App {
         let Some(pending) = &self.pending_deletion else {
             return;
         };
+
+        // Check if confirmation is enabled for this type
+        let confirmation_enabled = match pending {
+            PendingDeletion::Mod { .. } => self.state.config.confirm_mod_deletion,
+            PendingDeletion::Profile { .. } => self.state.config.confirm_profile_deletion,
+        };
+
+        // If confirmation is disabled, perform deletion immediately
+        if !confirmation_enabled {
+            self.perform_pending_deletion();
+            return;
+        }
 
         // Extract info based on deletion type
         let (item_type, item_name) = match pending {
@@ -1207,30 +1237,34 @@ impl App {
         if cancelled {
             self.pending_deletion = None;
         } else if confirmed {
-            match &self.pending_deletion {
-                Some(PendingDeletion::Mod { row_index, .. }) => {
-                    let row_index = *row_index;
-                    let active_profile = self.state.mod_data.active_profile.clone();
-                    if let Some(profile) = self.state.mod_data.profiles.get_mut(&active_profile) {
-                        profile.mods.remove(row_index);
-                        self.state.mod_data.save().unwrap();
-                    }
-                }
-                Some(PendingDeletion::Profile { profile_name }) => {
-                    let profile_name = profile_name.clone();
-                    self.state.mod_data.profiles.remove(&profile_name);
-                    // Select a different profile if we deleted the active one
-                    if self.state.mod_data.active_profile == profile_name {
-                        if let Some(first_profile) = self.state.mod_data.profiles.keys().next() {
-                            self.state.mod_data.active_profile = first_profile.clone();
-                        }
-                    }
+            self.perform_pending_deletion();
+        }
+    }
+
+    fn perform_pending_deletion(&mut self) {
+        match &self.pending_deletion {
+            Some(PendingDeletion::Mod { row_index, .. }) => {
+                let row_index = *row_index;
+                let active_profile = self.state.mod_data.active_profile.clone();
+                if let Some(profile) = self.state.mod_data.profiles.get_mut(&active_profile) {
+                    profile.mods.remove(row_index);
                     self.state.mod_data.save().unwrap();
                 }
-                None => {}
             }
-            self.pending_deletion = None;
+            Some(PendingDeletion::Profile { profile_name }) => {
+                let profile_name = profile_name.clone();
+                self.state.mod_data.profiles.remove(&profile_name);
+                // Select a different profile if we deleted the active one
+                if self.state.mod_data.active_profile == profile_name {
+                    if let Some(first_profile) = self.state.mod_data.profiles.keys().next() {
+                        self.state.mod_data.active_profile = first_profile.clone();
+                    }
+                }
+                self.state.mod_data.save().unwrap();
+            }
+            None => {}
         }
+        self.pending_deletion = None;
     }
 
     fn show_lints_toggle(&mut self, ctx: &egui::Context) {
