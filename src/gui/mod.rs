@@ -160,7 +160,7 @@ pub struct App {
     self_update_rid: Option<MessageHandle<SelfUpdateProgress>>,
     original_exe_path: Option<PathBuf>,
     problematic_mod_id: Option<u32>,
-    pending_deletion: Option<PendingModDeletion>,
+    pending_deletion: Option<PendingDeletion>,
 }
 
 #[derive(Default)]
@@ -801,7 +801,7 @@ impl App {
 
         // Transfer pending deletion to App for confirmation dialog
         if let Some((mod_name, row_index)) = ctx.pending_delete {
-            self.pending_deletion = Some(PendingModDeletion {
+            self.pending_deletion = Some(PendingDeletion::Mod {
                 mod_name,
                 row_index,
             });
@@ -1156,8 +1156,11 @@ impl App {
             return;
         };
 
-        let mod_name = pending.mod_name.clone();
-        let row_index = pending.row_index;
+        // Extract info based on deletion type
+        let (item_type, item_name) = match pending {
+            PendingDeletion::Mod { mod_name, .. } => ("mod", mod_name.clone()),
+            PendingDeletion::Profile { profile_name } => ("profile", profile_name.clone()),
+        };
 
         let mut confirmed = false;
         let mut cancelled = false;
@@ -1169,16 +1172,16 @@ impl App {
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(8.0);
-                    ui.label("Are you sure you want to delete this mod?");
+                    ui.label(format!("Are you sure you want to delete this {item_type}?"));
                     ui.add_space(8.0);
 
-                    // Show the mod name in a highlighted box
+                    // Show the item name in a highlighted box
                     egui::Frame::NONE
                         .fill(ui.visuals().extreme_bg_color)
                         .inner_margin(8.0)
                         .corner_radius(4.0)
                         .show(ui, |ui| {
-                            ui.label(egui::RichText::new(&mod_name).strong());
+                            ui.label(egui::RichText::new(&item_name).strong());
                         });
 
                     ui.add_space(16.0);
@@ -1204,11 +1207,27 @@ impl App {
         if cancelled {
             self.pending_deletion = None;
         } else if confirmed {
-            // Perform the actual deletion
-            let active_profile = self.state.mod_data.active_profile.clone();
-            if let Some(profile) = self.state.mod_data.profiles.get_mut(&active_profile) {
-                profile.mods.remove(row_index);
-                self.state.mod_data.save().unwrap();
+            match &self.pending_deletion {
+                Some(PendingDeletion::Mod { row_index, .. }) => {
+                    let row_index = *row_index;
+                    let active_profile = self.state.mod_data.active_profile.clone();
+                    if let Some(profile) = self.state.mod_data.profiles.get_mut(&active_profile) {
+                        profile.mods.remove(row_index);
+                        self.state.mod_data.save().unwrap();
+                    }
+                }
+                Some(PendingDeletion::Profile { profile_name }) => {
+                    let profile_name = profile_name.clone();
+                    self.state.mod_data.profiles.remove(&profile_name);
+                    // Select a different profile if we deleted the active one
+                    if self.state.mod_data.active_profile == profile_name {
+                        if let Some(first_profile) = self.state.mod_data.profiles.keys().next() {
+                            self.state.mod_data.active_profile = first_profile.clone();
+                        }
+                    }
+                    self.state.mod_data.save().unwrap();
+                }
+                None => {}
             }
             self.pending_deletion = None;
         }
@@ -1769,10 +1788,10 @@ struct WindowLintReport;
 
 struct WindowLintsToggle;
 
-/// Holds information about a mod pending deletion confirmation
-struct PendingModDeletion {
-    mod_name: String,
-    row_index: usize,
+/// Holds information about a pending deletion confirmation
+enum PendingDeletion {
+    Mod { mod_name: String, row_index: usize },
+    Profile { profile_name: String },
 }
 
 impl eframe::App for App {
@@ -2031,13 +2050,17 @@ impl eframe::App for App {
                 */
             };
 
-            if named_combobox::ui(
+            let (modified, pending_profile_delete) = named_combobox::ui(
                 ui,
                 "profile",
                 self.state.mod_data.deref_mut().deref_mut(),
                 Some(buttons),
-            ) {
+            );
+            if modified {
                 self.state.mod_data.save().unwrap();
+            }
+            if let Some(profile_name) = pending_profile_delete {
+                self.pending_deletion = Some(PendingDeletion::Profile { profile_name });
             }
 
             ui.separator();

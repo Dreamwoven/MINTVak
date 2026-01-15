@@ -64,21 +64,23 @@ impl NamedEntries<ModProfile> for ModData {
     }
 }
 
-/// Render and return whether any changes were made
+/// Render and return (modified, pending_delete_name)
+/// If pending_delete_name is Some, the caller should show a confirmation dialog
 pub(crate) fn ui<E, N>(
     ui: &mut egui::Ui,
     name: &str,
     entries: &mut N,
     additional_ui: Option<impl FnOnce(&mut egui::Ui, &mut N)>,
-) -> bool
+) -> (bool, Option<String>)
 where
     N: NamedEntries<E>,
 {
     let mut modified = false;
+    let mut pending_delete: Option<String> = None;
     ui.push_id(name, |ui| {
         ui.horizontal(|ui| {
             mk_add(ui, name, entries, &mut modified);
-            mk_delete(ui, name, entries, &mut modified);
+            mk_delete(ui, name, entries, &mut pending_delete);
             mk_rename(ui, name, entries, &mut modified);
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
@@ -94,10 +96,10 @@ where
             });
         });
     });
-    modified
+    (modified, pending_delete)
 }
 
-fn mk_delete<E, N>(ui: &mut egui::Ui, name: &str, entries: &mut N, modified: &mut bool)
+fn mk_delete<E, N>(ui: &mut egui::Ui, name: &str, entries: &mut N, pending_delete: &mut Option<String>)
 where
     N: NamedEntries<E>,
 {
@@ -110,8 +112,7 @@ where
                 .on_hover_text_at_pointer(format!("Delete {name}"))
                 .clicked()
             {
-                entries.remove_selected();
-                *modified = true;
+                *pending_delete = Some(entries.selected_name().to_string());
             }
         });
     });
