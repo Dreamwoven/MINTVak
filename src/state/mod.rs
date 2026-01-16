@@ -343,6 +343,8 @@ pub struct Config {
     pub confirm_mod_deletion: bool,
     #[serde(default = "default_true")]
     pub confirm_profile_deletion: bool,
+    #[serde(default)]
+    pub backup_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -419,6 +421,7 @@ impl Default for Config!["0.0.0"] {
             sorting_config: None,
             confirm_mod_deletion: true,
             confirm_profile_deletion: true,
+            backup_path: None,
         }
     }
 }

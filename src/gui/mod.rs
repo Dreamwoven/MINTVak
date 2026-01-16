@@ -839,6 +839,56 @@ impl App {
         string
     }
 
+    fn create_backup(dirs: &Dirs, backup_base_path: &str) -> Result<String, String> {
+        use std::fs;
+        use chrono::Local;
+
+        // Create timestamp for backup folder name
+        let timestamp = Local::now().format("%Y-%m-%d-%H-%M-%S").to_string();
+        let backup_folder_name = format!("backup_{}", timestamp);
+        let backup_path = PathBuf::from(backup_base_path).join(&backup_folder_name);
+
+        // Create backup directory
+        fs::create_dir_all(&backup_path)
+            .map_err(|e| format!("Failed to create backup directory: {}", e))?;
+
+        // Copy config directory contents
+        let config_dir = &dirs.config_dir;
+        if config_dir.exists() {
+            Self::copy_dir_contents(config_dir, &backup_path.join("config"))
+                .map_err(|e| format!("Failed to backup config: {}", e))?;
+        }
+
+        // Copy data directory contents
+        let data_dir = &dirs.data_dir;
+        if data_dir.exists() {
+            Self::copy_dir_contents(data_dir, &backup_path.join("data"))
+                .map_err(|e| format!("Failed to backup data: {}", e))?;
+        }
+
+        Ok(backup_path.to_string_lossy().to_string())
+    }
+
+    fn copy_dir_contents(src: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
+        use std::fs;
+
+        fs::create_dir_all(dst)?;
+
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let path = entry.path();
+            let dest_path = dst.join(entry.file_name());
+
+            if path.is_dir() {
+                Self::copy_dir_contents(&path, &dest_path)?;
+            } else {
+                fs::copy(&path, &dest_path)?;
+            }
+        }
+
+        Ok(())
+    }
+
     fn show_update_window(&mut self, ctx: &egui::Context) {
         if let (Some(update), Some(update_time)) =
             (self.available_update.as_ref(), self.show_update_time)
@@ -1126,6 +1176,46 @@ impl App {
                         {
                             self.state.config.save().unwrap();
                         }
+                        ui.end_row();
+
+                        ui.label("Backup path:");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut window.backup_path)
+                                    .desired_width(200.0),
+                            );
+                            if ui.button("browse").clicked() {
+                                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                    window.backup_path = folder.to_string_lossy().to_string();
+                                }
+                            }
+                            if ui.button("Save path").clicked() {
+                                self.state.config.backup_path = Some(PathBuf::from(&window.backup_path));
+                                self.state.config.save().unwrap();
+                            }
+                        });
+                        ui.end_row();
+
+                        ui.label("");
+                        ui.horizontal(|ui| {
+                            if ui.button("Create Backup Now").clicked() {
+                                let backup_result = Self::create_backup(
+                                    &self.state.dirs,
+                                    &window.backup_path,
+                                );
+                                window.backup_status = Some(match backup_result {
+                                    Ok(path) => (true, format!("Backup created: {}", path)),
+                                    Err(e) => (false, format!("Backup failed: {}", e)),
+                                });
+                            }
+                            if let Some((success, msg)) = &window.backup_status {
+                                if *success {
+                                    ui.colored_label(Color32::LIGHT_GREEN, msg);
+                                } else {
+                                    ui.colored_label(ui.visuals().error_fg_color, msg);
+                                }
+                            }
+                        });
                         ui.end_row();
 
                         ui.label("Mod providers:");
@@ -1801,6 +1891,8 @@ impl WindowProviderParameters {
 struct WindowSettings {
     drg_pak_path: String,
     drg_pak_path_err: Option<String>,
+    backup_path: String,
+    backup_status: Option<(bool, String)>, // (success, message)
 }
 
 impl WindowSettings {
@@ -1811,10 +1903,26 @@ impl WindowSettings {
             .as_ref()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
+        let backup_path = state
+            .config
+            .backup_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| Self::default_backup_path());
         Self {
             drg_pak_path: path,
             drg_pak_path_err: None,
+            backup_path,
+            backup_status: None,
         }
+    }
+
+    fn default_backup_path() -> String {
+        directories::UserDirs::new()
+            .and_then(|dirs| dirs.document_dir().map(|d| d.to_path_buf()))
+            .map(|d| d.join("mint_backups"))
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default()
     }
 }
 
