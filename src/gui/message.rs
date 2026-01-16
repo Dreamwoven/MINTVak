@@ -18,7 +18,7 @@ use super::{
 use crate::gui::LastAction;
 use crate::integrate::*;
 use crate::mod_lints::{LintId, LintReport};
-use crate::state::{ModData_v0_1_0 as ModData, ModOrGroup};
+use crate::state::{ModData_v0_2_0 as ModData, ModOrGroup};
 use crate::*;
 use crate::{
     providers::{FetchProgress, ModInfo, ModStore},

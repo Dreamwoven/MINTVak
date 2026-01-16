@@ -47,7 +47,7 @@ use crate::{
     providers::{
         ApprovalStatus, FetchProgress, ModInfo, ModSpecification, ModStore, ProviderFactory,
     },
-    state::{ModConfig, ModData_v0_1_0 as ModData, ModOrGroup, ModProfile, State},
+    state::{ModConfig, ModData_v0_2_0 as ModData, ModOrGroup, ModProfile_v0_2_0 as ModProfile, State},
 };
 use message::MessageHandle;
 use request_counter::{RequestCounter, RequestID};
@@ -161,6 +161,10 @@ pub struct App {
     original_exe_path: Option<PathBuf>,
     problematic_mod_id: Option<u32>,
     pending_deletion: Option<PendingDeletion>,
+    // Folder management
+    create_folder_popup: Option<String>, // Some(buffer) when popup is open
+    rename_folder_popup: Option<(String, String)>, // Some((old_name, buffer))
+    expand_folder: Option<String>, // Folder to expand on next frame
 }
 
 #[derive(Default)]
@@ -254,29 +258,53 @@ impl App {
             original_exe_path: None,
             problematic_mod_id: None,
             pending_deletion: None,
+            create_folder_popup: None,
+            rename_folder_popup: None,
+            expand_folder: None,
         })
     }
 
     fn ui_profile(&mut self, ui: &mut Ui, profile: &str) {
         let sorting_config = self.get_sorting_config();
 
-        let ModData {
-            profiles, groups, ..
-        } = self.state.mod_data.deref_mut().deref_mut();
+        let mod_data = self.state.mod_data.deref_mut().deref_mut();
+        let active_profile_name = mod_data.active_profile.clone();
+        
+        // Get mutable reference to profiles map
+        let profiles = &mut mod_data.profiles;
+        
+        // Get folder names from the active profile
+        let folder_names: Vec<String> = profiles
+            .get(&active_profile_name)
+            .map(|p| p.groups.keys().cloned().collect())
+            .unwrap_or_default();
 
         struct Ctx {
             needs_save: bool,
             scroll_to_match: bool,
             btn_remove: Option<usize>,
             pending_delete: Option<(String, usize)>, // (mod_name, row_index)
+            pending_folder_delete: Option<String>, // folder_name
+            pending_folder_mod_delete: Option<(String, usize)>, // (folder_name, mod_index) - delete mod inside folder
             add_deps: Option<Vec<ModSpecification>>,
+            // Folder operations
+            move_mod_to_folder: Option<(usize, String)>, // (mod_index, folder_name)
+            move_mod_from_folder: Option<(String, usize)>, // (folder_name, mod_index_in_folder) -> to root
+            move_mod_between_folders: Option<(String, usize, String)>, // (from_folder, mod_index, to_folder)
+            rename_folder: Option<String>, // folder name to rename
         }
         let mut ctx = Ctx {
             needs_save: false,
             scroll_to_match: self.scroll_to_match,
             btn_remove: None,
             pending_delete: None,
+            pending_folder_delete: None,
+            pending_folder_mod_delete: None,
             add_deps: None,
+            move_mod_to_folder: None,
+            move_mod_from_folder: None,
+            move_mod_between_folders: None,
+            rename_folder: None,
         };
 
         let ui_profile = |ui: &mut Ui, profile: &mut ModProfile| {
@@ -294,7 +322,7 @@ impl App {
                             enabled,
                         } => Box::new(
                             enabled
-                                .then(|| groups.get(group_name))
+                                .then(|| profile.groups.get(group_name))
                                 .flatten()
                                 .into_iter()
                                 .flat_map(|g| {
@@ -430,9 +458,10 @@ impl App {
 
             let mut ui_mod = |ctx: &mut Ctx,
                               ui: &mut Ui,
-                              _group: Option<&str>,
+                              in_folder: Option<&str>,
                               row_index: usize,
-                              mc: &mut ModConfig| {
+                              mc: &mut ModConfig,
+                              override_priority: Option<i32>| {
                 if !mc.enabled {
                     let vis = ui.visuals_mut();
                     vis.override_text_color = Some(vis.text_color());
@@ -445,6 +474,22 @@ impl App {
                     .changed()
                 {
                     ctx.needs_save = true;
+                }
+
+                // Move to folder dropdown (only for mods at root level)
+                if in_folder.is_none() && !folder_names.is_empty() {
+                    egui::ComboBox::from_id_salt(format!("move-to-folder-{}", row_index))
+                        .selected_text("📁")
+                        .width(40.0)
+                        .show_ui(ui, |ui| {
+                            for folder_name in &folder_names {
+                                if ui.selectable_label(false, folder_name).clicked() {
+                                    ctx.move_mod_to_folder = Some((row_index, folder_name.clone()));
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text("Move to folder");
                 }
 
                 /*
@@ -519,7 +564,12 @@ impl App {
                     ui.scope(|ui| {
                         ui.style_mut().spacing.interact_size.x = 30.;
                         let dark = ui.visuals().dark_mode;
-                        match mc.priority.cmp(&0) {
+                        
+                        // Use override priority if set, otherwise use mod's own priority
+                        let display_priority = override_priority.unwrap_or(mc.priority);
+                        let is_overridden = override_priority.is_some();
+                        
+                        match display_priority.cmp(&0) {
                             std::cmp::Ordering::Less => {
                                 ui.visuals_mut().override_text_color = Some(if dark {
                                     Color32::LIGHT_RED
@@ -536,21 +586,41 @@ impl App {
                             }
                             _ => {}
                         }
-                        ui.add(
-                            egui::DragValue::new(&mut mc.priority)
-                                .custom_formatter(|n, _| {
-                                    if n == 0. {
-                                        "-".to_string()
-                                    } else {
-                                        format!("{n}")
-                                    }
-                                })
-                                .speed(0.05)
-                                .range(RangeInclusive::new(-999, 999)),
-                        )
-                        .on_hover_text_at_pointer(
-                            "Load Priority\nIn case of asset conflict, mods with higher priority take precedent.\nCan have duplicate values.",
-                        );
+                        
+                        if is_overridden {
+                            // Show folder's priority (read-only)
+                            ui.add_enabled(false,
+                                egui::DragValue::new(&mut display_priority.clone())
+                                    .custom_formatter(|n, _| {
+                                        if n == 0. {
+                                            "-".to_string()
+                                        } else {
+                                            format!("{n}")
+                                        }
+                                    })
+                            )
+                            .on_hover_text_at_pointer(
+                                "Load Priority (set by folder)\nFolder priority override is enabled.",
+                            );
+                        } else {
+                            if ui.add(
+                                egui::DragValue::new(&mut mc.priority)
+                                    .custom_formatter(|n, _| {
+                                        if n == 0. {
+                                            "-".to_string()
+                                        } else {
+                                            format!("{n}")
+                                        }
+                                    })
+                                    .speed(0.05)
+                                    .range(RangeInclusive::new(-999, 999)),
+                            )
+                            .on_hover_text_at_pointer(
+                                "Load Priority\nIn case of asset conflict, mods with higher priority take precedent.\nCan have duplicate values.",
+                            ).changed() {
+                                ctx.needs_save = true;
+                            }
+                        }
                     });
 
                     if ui
@@ -683,25 +753,26 @@ impl App {
                         ui.visuals_mut().widgets.active.weak_bg_fill = colors::DARKER_RED;
                         if ui
                             .add(Button::new(" 🗑 "))
-                            .on_hover_text_at_pointer("Delete mod")
+                            .on_hover_text_at_pointer(match mc {
+                                ModOrGroup::Individual(_) => "Delete mod",
+                                ModOrGroup::Group { .. } => "Delete folder (mods move to root)",
+                            })
                             .clicked()
                         {
-                            // Get the mod/group name for the confirmation dialog
-                            let name = match mc {
+                            match mc {
                                 ModOrGroup::Individual(mod_config) => {
-                                    mod_config.spec.url.clone()
+                                    ctx.pending_delete = Some((mod_config.spec.url.clone(), row_index));
                                 }
                                 ModOrGroup::Group { group_name, .. } => {
-                                    group_name.clone()
+                                    ctx.pending_folder_delete = Some(group_name.clone());
                                 }
-                            };
-                            ctx.pending_delete = Some((name, row_index));
+                            }
                         };
                     });
 
                     match mc {
                         ModOrGroup::Individual(mc) => {
-                            ui_mod(ctx, ui, None, row_index, mc);
+                            ui_mod(ctx, ui, None, row_index, mc, None);
                         }
                         ModOrGroup::Group {
                             group_name,
@@ -714,17 +785,110 @@ impl App {
                             {
                                 ctx.needs_save = true;
                             }
-                            ui.collapsing(group_name.as_str(), |ui| {
-                                for (index, m) in groups
-                                    .get_mut(group_name)
-                                    .unwrap()
-                                    .mods
-                                    .iter_mut()
-                                    .enumerate()
-                                {
-                                    ui.horizontal(|ui| ui_mod(ctx, ui, Some(group_name), index, m));
-                                }
-                            });
+                            
+                            // Rename button for folder
+                            if ui.button("✏").on_hover_text("Rename folder").clicked() {
+                                ctx.rename_folder = Some(group_name.clone());
+                            }
+                            
+                            let group_name_clone = group_name.clone();
+                            let folder_id = ui.make_persistent_id(format!("folder-{}", group_name));
+                            
+                            // Check if this folder should be opened (e.g., after moving a mod into it)
+                            let should_open = self.expand_folder.as_ref() == Some(group_name);
+                            
+                            // Use open() to force-open when a mod was just moved in
+                            let mut header = egui::CollapsingHeader::new(group_name.as_str())
+                                .id_salt(folder_id)
+                                .default_open(false);
+                            
+                            if should_open {
+                                header = header.open(Some(true));
+                            }
+                            
+                            header.show(ui, |ui| {
+                                    if let Some(group) = profile.groups.get_mut(&group_name_clone) {
+                                        // Folder priority override controls
+                                        ui.horizontal(|ui| {
+                                            let has_override = group.priority_override.is_some();
+                                            let mut override_enabled = has_override;
+                                            
+                                            if ui.checkbox(&mut override_enabled, "Priority override:")
+                                                .on_hover_text("When enabled, all mods in this folder use the folder's priority")
+                                                .changed()
+                                            {
+                                                if override_enabled {
+                                                    group.priority_override = Some(0);
+                                                } else {
+                                                    group.priority_override = None;
+                                                }
+                                                ctx.needs_save = true;
+                                            }
+                                            
+                                            if let Some(ref mut priority) = group.priority_override {
+                                                if ui.add(egui::DragValue::new(priority)).changed() {
+                                                    ctx.needs_save = true;
+                                                }
+                                            }
+                                        });
+                                        
+                                        ui.separator();
+                                        
+                                        let override_priority = group.priority_override;
+                                        let mut move_out_index: Option<usize> = None;
+                                        let mut move_to_other_folder: Option<(usize, String)> = None;
+                                        let mut delete_mod_index: Option<usize> = None;
+                                        
+                                        for (index, m) in group.mods.iter_mut().enumerate() {
+                                            ui.horizontal(|ui| {
+                                                // Delete button (red styling)
+                                                ui.scope(|ui| {
+                                                    ui.visuals_mut().widgets.hovered.weak_bg_fill = colors::DARK_RED;
+                                                    ui.visuals_mut().widgets.active.weak_bg_fill = colors::DARKER_RED;
+                                                    if ui.button(" 🗑 ").on_hover_text("Delete mod").clicked() {
+                                                        delete_mod_index = Some(index);
+                                                    }
+                                                });
+                                                
+                                                // Move dropdown - shows root + other folders
+                                                egui::ComboBox::from_id_salt(format!("move-in-folder-{}-{}", group_name_clone, index))
+                                                    .selected_text("📁")
+                                                    .width(40.0)
+                                                    .show_ui(ui, |ui| {
+                                                        // Option to move to root
+                                                        if ui.selectable_label(false, "📤 (root)").clicked() {
+                                                            move_out_index = Some(index);
+                                                        }
+                                                        ui.separator();
+                                                        // Options for other folders
+                                                        for other_folder in &folder_names {
+                                                            if other_folder != &group_name_clone {
+                                                                if ui.selectable_label(false, format!("📁 {}", other_folder)).clicked() {
+                                                                    move_to_other_folder = Some((index, other_folder.clone()));
+                                                                }
+                                                            }
+                                                        }
+                                                    })
+                                                    .response
+                                                    .on_hover_text("Move to...");
+                                                
+                                                ui_mod(ctx, ui, Some(&group_name_clone), index, m, override_priority);
+                                            });
+                                        }
+                                        if let Some(idx) = move_out_index {
+                                            ctx.move_mod_from_folder = Some((group_name_clone.clone(), idx));
+                                        }
+                                        if let Some((idx, target_folder)) = move_to_other_folder {
+                                            ctx.move_mod_between_folders = Some((group_name_clone.clone(), idx, target_folder));
+                                        }
+                                        if let Some(idx) = delete_mod_index {
+                                            // Get mod name for confirmation
+                                            if let Some(m) = group.mods.get(idx) {
+                                                ctx.pending_folder_mod_delete = Some((group_name_clone.clone(), idx));
+                                            }
+                                        }
+                                    }
+                                });
                         }
                     }
                 };
@@ -805,6 +969,102 @@ impl App {
                 mod_name,
                 row_index,
             });
+        }
+
+        // Handle folder rename request
+        if let Some(folder_name) = ctx.rename_folder {
+            self.rename_folder_popup = Some((folder_name.clone(), folder_name));
+        }
+
+        // Handle move mod to folder
+        let mut did_move_to_folder = false;
+        if let Some((mod_index, folder_name)) = ctx.move_mod_to_folder {
+            let active_profile = self.state.mod_data.active_profile.clone();
+            if let Some(profile) = self.state.mod_data.profiles.get_mut(&active_profile) {
+                // First verify the target folder exists
+                let folder_exists = profile.groups.contains_key(&folder_name);
+                if folder_exists {
+                    if let Some(ModOrGroup::Individual(mod_config)) = profile.mods.get(mod_index).cloned() {
+                        // Remove from root
+                        profile.mods.remove(mod_index);
+                        // Add to folder (we know it exists)
+                        if let Some(group) = profile.groups.get_mut(&folder_name) {
+                            group.mods.push(mod_config);
+                        }
+                        // Expand the folder so user can see where mod went
+                        self.expand_folder = Some(folder_name);
+                        did_move_to_folder = true;
+                        ctx.needs_save = true;
+                    }
+                }
+            }
+        }
+        
+        // Clear expand_folder after it's been used (it was set last frame, used this frame)
+        if self.expand_folder.is_some() && !did_move_to_folder {
+            self.expand_folder = None;
+        }
+
+        // Handle move mod out of folder
+        if let Some((folder_name, mod_index)) = ctx.move_mod_from_folder {
+            let active_profile = self.state.mod_data.active_profile.clone();
+            if let Some(profile) = self.state.mod_data.profiles.get_mut(&active_profile) {
+                if let Some(group) = profile.groups.get_mut(&folder_name) {
+                    if mod_index < group.mods.len() {
+                        let mod_config = group.mods.remove(mod_index);
+                        // Add to root of profile
+                        profile.mods.push(ModOrGroup::Individual(mod_config));
+                        ctx.needs_save = true;
+                    }
+                }
+            }
+        }
+
+        // Handle move mod between folders
+        if let Some((from_folder, mod_index, to_folder)) = ctx.move_mod_between_folders {
+            let active_profile = self.state.mod_data.active_profile.clone();
+            if let Some(profile) = self.state.mod_data.profiles.get_mut(&active_profile) {
+                // Verify both folders exist
+                let from_exists = profile.groups.contains_key(&from_folder);
+                let to_exists = profile.groups.contains_key(&to_folder);
+                
+                if from_exists && to_exists {
+                    // Remove from source folder
+                    let mod_config = profile.groups.get_mut(&from_folder)
+                        .and_then(|g| if mod_index < g.mods.len() { Some(g.mods.remove(mod_index)) } else { None });
+                    
+                    // Add to target folder
+                    if let Some(mod_config) = mod_config {
+                        if let Some(to_group) = profile.groups.get_mut(&to_folder) {
+                            to_group.mods.push(mod_config);
+                        }
+                        // Expand target folder
+                        self.expand_folder = Some(to_folder);
+                        ctx.needs_save = true;
+                    }
+                }
+            }
+        }
+
+        // Handle folder deletion request
+        if let Some(folder_name) = ctx.pending_folder_delete {
+            self.pending_deletion = Some(PendingDeletion::Folder { folder_name });
+        }
+
+        // Handle mod deletion inside folder
+        if let Some((folder_name, mod_index)) = ctx.pending_folder_mod_delete {
+            let active_profile = self.state.mod_data.active_profile.clone();
+            if let Some(profile) = self.state.mod_data.profiles.get(&active_profile) {
+                if let Some(group) = profile.groups.get(&folder_name) {
+                    if let Some(m) = group.mods.get(mod_index) {
+                        self.pending_deletion = Some(PendingDeletion::FolderMod { 
+                            folder_name, 
+                            mod_index,
+                            mod_name: m.spec.url.clone(),
+                        });
+                    }
+                }
+            }
         }
 
         if let Some(add_deps) = ctx.add_deps {
@@ -1268,6 +1528,8 @@ impl App {
         let confirmation_enabled = match pending {
             PendingDeletion::Mod { .. } => self.state.config.confirm_mod_deletion,
             PendingDeletion::Profile { .. } => self.state.config.confirm_profile_deletion,
+            PendingDeletion::Folder { .. } => self.state.config.confirm_mod_deletion,
+            PendingDeletion::FolderMod { .. } => self.state.config.confirm_mod_deletion,
         };
 
         // If confirmation is disabled, perform deletion immediately
@@ -1280,6 +1542,8 @@ impl App {
         let (item_type, item_name) = match pending {
             PendingDeletion::Mod { mod_name, .. } => ("mod", mod_name.clone()),
             PendingDeletion::Profile { profile_name } => ("profile", profile_name.clone()),
+            PendingDeletion::Folder { folder_name } => ("folder", folder_name.clone()),
+            PendingDeletion::FolderMod { mod_name, .. } => ("mod", mod_name.clone()),
         };
 
         let mut confirmed = false;
@@ -1350,11 +1614,200 @@ impl App {
                         self.state.mod_data.active_profile = first_profile.clone();
                     }
                 }
+                
+                self.state.mod_data.save().unwrap();
+            }
+            Some(PendingDeletion::Folder { folder_name }) => {
+                let folder_name = folder_name.clone();
+                let active_profile = self.state.mod_data.active_profile.clone();
+                
+                if let Some(profile) = self.state.mod_data.profiles.get_mut(&active_profile) {
+                    // Move all mods from folder back to root
+                    if let Some(group) = profile.groups.remove(&folder_name) {
+                        for mod_config in group.mods {
+                            profile.mods.push(ModOrGroup::Individual(mod_config));
+                        }
+                    }
+                    // Remove the group reference from profile's mods list
+                    profile.mods.retain(|item| {
+                        !matches!(item, ModOrGroup::Group { group_name, .. } if group_name == &folder_name)
+                    });
+                }
+                
+                self.state.mod_data.save().unwrap();
+            }
+            Some(PendingDeletion::FolderMod { folder_name, mod_index, .. }) => {
+                let folder_name = folder_name.clone();
+                let mod_index = *mod_index;
+                let active_profile = self.state.mod_data.active_profile.clone();
+                
+                if let Some(profile) = self.state.mod_data.profiles.get_mut(&active_profile) {
+                    if let Some(group) = profile.groups.get_mut(&folder_name) {
+                        if mod_index < group.mods.len() {
+                            group.mods.remove(mod_index);
+                        }
+                    }
+                }
+                
                 self.state.mod_data.save().unwrap();
             }
             None => {}
         }
         self.pending_deletion = None;
+    }
+
+    fn show_create_folder_popup(&mut self, ctx: &egui::Context) {
+        if self.create_folder_popup.is_none() {
+            return;
+        }
+
+        let mut should_close = false;
+        let mut should_create = false;
+
+        // Get active profile for checking existing folders
+        let active_profile = self.state.mod_data.active_profile.clone();
+
+        egui::Window::new("Create Folder")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(8.0);
+                    ui.label("Enter folder name:");
+                    ui.add_space(8.0);
+
+                    let buffer = self.create_folder_popup.as_mut().unwrap();
+                    let response = ui.text_edit_singleline(buffer);
+                    
+                    // Auto-focus the text field
+                    if response.gained_focus() || buffer.is_empty() {
+                        response.request_focus();
+                    }
+
+                    // Check if name already exists in active profile
+                    let name_exists = self.state.mod_data.profiles
+                        .get(&active_profile)
+                        .map(|p| p.groups.contains_key(buffer.as_str()))
+                        .unwrap_or(false);
+                    let name_valid = !buffer.trim().is_empty() && !name_exists;
+
+                    if name_exists && !buffer.is_empty() {
+                        ui.colored_label(ui.visuals().error_fg_color, "Folder name already exists");
+                    }
+
+                    ui.add_space(16.0);
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            should_close = true;
+                        }
+                        ui.add_space(16.0);
+                        if ui.add_enabled(name_valid, egui::Button::new("Create")).clicked() 
+                            || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && name_valid)
+                        {
+                            should_create = true;
+                        }
+                    });
+                    ui.add_space(8.0);
+                });
+            });
+
+        if should_close {
+            self.create_folder_popup = None;
+        } else if should_create {
+            let folder_name = self.create_folder_popup.take().unwrap().trim().to_string();
+            // Add group to active profile
+            if let Some(profile) = self.state.mod_data.profiles.get_mut(&active_profile) {
+                // Create the group in profile's groups map
+                profile.groups.insert(folder_name.clone(), crate::state::ModGroup { 
+                    mods: vec![],
+                    priority_override: None,
+                });
+                // Add group reference to profile's mods list
+                profile.mods.push(ModOrGroup::Group { group_name: folder_name, enabled: true });
+            }
+            self.state.mod_data.save().unwrap();
+        }
+    }
+
+    fn show_rename_folder_popup(&mut self, ctx: &egui::Context) {
+        if self.rename_folder_popup.is_none() {
+            return;
+        }
+
+        let mut should_close = false;
+        let mut should_rename = false;
+        
+        // Get active profile for checking existing folders
+        let active_profile = self.state.mod_data.active_profile.clone();
+
+        egui::Window::new("Rename Folder")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(8.0);
+                    ui.label("Enter new folder name:");
+                    ui.add_space(8.0);
+
+                    let (old_name, buffer) = self.rename_folder_popup.as_mut().unwrap();
+                    let response = ui.text_edit_singleline(buffer);
+
+                    // Check if name already exists (and is different from current)
+                    let name_exists = buffer != old_name && self.state.mod_data.profiles
+                        .get(&active_profile)
+                        .map(|p| p.groups.contains_key(buffer.as_str()))
+                        .unwrap_or(false);
+                    let name_valid = !buffer.trim().is_empty() && !name_exists;
+
+                    if name_exists {
+                        ui.colored_label(ui.visuals().error_fg_color, "Folder name already exists");
+                    }
+
+                    ui.add_space(16.0);
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            should_close = true;
+                        }
+                        ui.add_space(16.0);
+                        if ui.add_enabled(name_valid, egui::Button::new("Rename")).clicked()
+                            || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && name_valid)
+                        {
+                            should_rename = true;
+                        }
+                    });
+                    ui.add_space(8.0);
+                });
+            });
+
+        if should_close {
+            self.rename_folder_popup = None;
+        } else if should_rename {
+            let (old_name, new_name) = self.rename_folder_popup.take().unwrap();
+            let new_name = new_name.trim().to_string();
+            
+            // Rename in active profile only
+            if let Some(profile) = self.state.mod_data.profiles.get_mut(&active_profile) {
+                // Move the group data to new key
+                if let Some(group) = profile.groups.remove(&old_name) {
+                    profile.groups.insert(new_name.clone(), group);
+                }
+                
+                // Update references in mods list
+                for item in &mut profile.mods {
+                    if let ModOrGroup::Group { group_name, .. } = item {
+                        if group_name == &old_name {
+                            *group_name = new_name.clone();
+                        }
+                    }
+                }
+            }
+            
+            self.state.mod_data.save().unwrap();
+        }
     }
 
     fn show_lints_toggle(&mut self, ctx: &egui::Context) {
@@ -1934,6 +2387,8 @@ struct WindowLintsToggle;
 enum PendingDeletion {
     Mod { mod_name: String, row_index: usize },
     Profile { profile_name: String },
+    Folder { folder_name: String },
+    FolderMod { folder_name: String, mod_index: usize, mod_name: String },
 }
 
 impl eframe::App for App {
@@ -1977,6 +2432,8 @@ impl eframe::App for App {
         self.show_lints_toggle(ctx);
         self.show_lint_report(ctx);
         self.show_delete_confirmation(ctx);
+        self.show_create_folder_popup(ctx);
+        self.show_rename_folder_popup(ctx);
 
         egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
             ui.with_layout(egui::Layout::right_to_left(Align::TOP), |ui| {
@@ -2018,18 +2475,18 @@ impl eframe::App for App {
                             }
 
                             if button.clicked() {
-                                let mut mod_configs = Vec::new();
                                 let mut mods = Vec::new();
                                 let active_profile = self.state.mod_data.active_profile.clone();
-                                self.state
+                                
+                                // Get mods with effective priority (respecting folder overrides)
+                                let mut mods_with_priority = self.state
                                     .mod_data
-                                    .for_each_enabled_mod(&active_profile, |mc| {
-                                        mod_configs.push(mc.clone());
-                                    });
+                                    .get_enabled_mods_with_priority(&active_profile);
 
-                                mod_configs.sort_by_key(|k| -k.priority);
+                                // Sort by effective priority (descending)
+                                mods_with_priority.sort_by_key(|(_, priority)| -priority);
 
-                                for config in mod_configs {
+                                for (config, _) in mods_with_priority {
                                     mods.push(config.spec.clone());
                                 }
 
@@ -2269,6 +2726,14 @@ impl eframe::App for App {
                 }
 
                 ui.add_space(16.);
+
+                // Create folder button
+                if ui.button("📁+").on_hover_text("Create new folder").clicked() {
+                    self.create_folder_popup = Some(String::new());
+                }
+
+                ui.add_space(8.);
+
                 // TODO: actually implement mod groups.
                 let search_string = &mut self.search_string;
                 let lower = search_string.to_lowercase();

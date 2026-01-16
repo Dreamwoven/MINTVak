@@ -43,11 +43,15 @@ fn is_zero(value: &i32) -> bool {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModGroup {
     pub mods: Vec<ModConfig>,
+    /// When Some, all mods in this group use this priority instead of their individual priority
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority_override: Option<i32>,
 }
 
 #[obake::versioned]
 #[obake(version("0.0.0"))]
 #[obake(version("0.1.0"))]
+#[obake(version("0.2.0"))]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModProfile {
     #[obake(cfg("0.0.0"))]
@@ -55,7 +59,13 @@ pub struct ModProfile {
 
     /// A profile can contain ordered individual mods mixed with mod groups.
     #[obake(cfg("0.1.0"))]
+    #[obake(cfg("0.2.0"))]
     pub mods: Vec<ModOrGroup>,
+    
+    /// Per-profile folder storage (added in 0.2.0)
+    #[obake(cfg("0.2.0"))]
+    #[serde(default)]
+    pub groups: BTreeMap<String, ModGroup>,
 }
 
 #[derive(Debug, Clone, Hash, Serialize, Deserialize)]
@@ -72,9 +82,19 @@ impl From<ModProfile!["0.0.0"]> for ModProfile!["0.1.0"] {
     }
 }
 
+impl From<ModProfile!["0.1.0"]> for ModProfile!["0.2.0"] {
+    fn from(legacy: ModProfile!["0.1.0"]) -> Self {
+        Self {
+            mods: legacy.mods,
+            groups: BTreeMap::new(), // Will be populated during ModData migration
+        }
+    }
+}
+
 #[obake::versioned]
 #[obake(version("0.0.0"))]
 #[obake(version("0.1.0"))]
+#[obake(version("0.2.0"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModData {
     pub active_profile: String,
@@ -82,11 +102,14 @@ pub struct ModData {
     pub profiles: BTreeMap<String, ModProfile!["0.0.0"]>,
     #[obake(cfg("0.1.0"))]
     pub profiles: BTreeMap<String, ModProfile!["0.1.0"]>,
+    #[obake(cfg("0.2.0"))]
+    pub profiles: BTreeMap<String, ModProfile!["0.2.0"]>,
+    /// Global groups storage (legacy, removed in 0.2.0)
     #[obake(cfg("0.1.0"))]
     pub groups: BTreeMap<String, ModGroup>,
 }
 
-impl ModData!["0.1.0"] {
+impl ModData!["0.2.0"] {
     pub fn for_each_mod_predicate<
         F: FnMut(&ModConfig),
         G: FnMut(bool /* mod group enabled? */) -> bool,
@@ -98,16 +121,19 @@ impl ModData!["0.1.0"] {
         mut g: G,
         mut p: P,
     ) {
-        for ref mod_or_group in &self.profiles.get(profile).unwrap().mods {
+        let prof = self.profiles.get(profile).unwrap();
+        for ref mod_or_group in &prof.mods {
             match mod_or_group {
                 ModOrGroup::Group {
                     group_name,
                     enabled,
                 } => {
                     if g(*enabled) {
-                        for mc in &self.groups.get(group_name).unwrap().mods {
-                            if p(mc) {
-                                f(mc);
+                        if let Some(group) = prof.groups.get(group_name) {
+                            for mc in &group.mods {
+                                if p(mc) {
+                                    f(mc);
+                                }
                             }
                         }
                     }
@@ -132,24 +158,34 @@ impl ModData!["0.1.0"] {
         mut g: G,
         mut p: P,
     ) {
-        for ref mut mod_or_group in &mut self.profiles.get_mut(profile).unwrap().mods {
-            match mod_or_group {
-                ModOrGroup::Group {
-                    group_name,
-                    enabled,
-                } => {
-                    if g(*enabled) {
-                        for mc in &mut self.groups.get_mut(group_name).unwrap().mods {
-                            if p(mc) {
-                                f(mc);
-                            }
+        let prof = self.profiles.get_mut(profile).unwrap();
+        // Need to iterate mods and groups separately due to borrow checker
+        let group_refs: Vec<_> = prof.mods.iter().filter_map(|m| {
+            if let ModOrGroup::Group { group_name, enabled } = m {
+                Some((group_name.clone(), *enabled))
+            } else {
+                None
+            }
+        }).collect();
+        
+        // Process groups
+        for (group_name, enabled) in group_refs {
+            if g(enabled) {
+                if let Some(group) = prof.groups.get_mut(&group_name) {
+                    for mc in &mut group.mods {
+                        if p(mc) {
+                            f(mc);
                         }
                     }
                 }
-                ModOrGroup::Individual(mc) => {
-                    if p(mc) {
-                        f(mc);
-                    }
+            }
+        }
+        
+        // Process individual mods
+        for mod_or_group in &mut prof.mods {
+            if let ModOrGroup::Individual(mc) = mod_or_group {
+                if p(mc) {
+                    f(mc);
                 }
             }
         }
@@ -163,6 +199,36 @@ impl ModData!["0.1.0"] {
         self.for_each_mod_predicate(profile, f, std::convert::identity, |mc| mc.enabled)
     }
 
+    /// Returns enabled mods with their effective priority (considering folder overrides)
+    /// Returns Vec of (ModConfig clone, effective_priority)
+    pub fn get_enabled_mods_with_priority(&self, profile: &str) -> Vec<(ModConfig, i32)> {
+        let mut result = Vec::new();
+        let prof = self.profiles.get(profile).unwrap();
+        for mod_or_group in &prof.mods {
+            match mod_or_group {
+                ModOrGroup::Group { group_name, enabled } => {
+                    if *enabled {
+                        if let Some(group) = prof.groups.get(group_name) {
+                            let override_priority = group.priority_override;
+                            for mc in &group.mods {
+                                if mc.enabled {
+                                    let effective_priority = override_priority.unwrap_or(mc.priority);
+                                    result.push((mc.clone(), effective_priority));
+                                }
+                            }
+                        }
+                    }
+                }
+                ModOrGroup::Individual(mc) => {
+                    if mc.enabled {
+                        result.push((mc.clone(), mc.priority));
+                    }
+                }
+            }
+        }
+        result
+    }
+
     pub fn for_each_mod_mut<F: FnMut(&mut ModConfig)>(&mut self, profile: &str, f: F) {
         self.for_each_mod_predicate_mut(profile, f, |_| true, |_| true)
     }
@@ -172,20 +238,19 @@ impl ModData!["0.1.0"] {
         profile: &str,
         mut f: F,
     ) -> bool {
-        self.profiles.get(profile).unwrap().mods.iter().any(|m| {
+        let prof = self.profiles.get(profile).unwrap();
+        prof.mods.iter().any(|m| {
             let f = &mut f;
             match m {
                 ModOrGroup::Individual(mc) => f(mc, None),
                 ModOrGroup::Group {
                     group_name,
                     enabled,
-                } => self
+                } => prof
                     .groups
                     .get(group_name)
-                    .unwrap()
-                    .mods
-                    .iter()
-                    .any(|mc| f(mc, Some(*enabled))),
+                    .map(|g| g.mods.iter().any(|mc| f(mc, Some(*enabled))))
+                    .unwrap_or(false),
             }
         })
     }
@@ -197,27 +262,46 @@ impl ModData!["0.1.0"] {
         profile: &str,
         mut f: F,
     ) -> bool {
-        self.profiles
-            .get_mut(profile)
-            .unwrap()
-            .mods
-            .iter_mut()
-            .any(|m| {
-                let f = &mut f;
-                match m {
-                    ModOrGroup::Individual(mc) => f(mc, None),
-                    ModOrGroup::Group {
-                        group_name,
-                        enabled,
-                    } => self
-                        .groups
-                        .get_mut(group_name)
-                        .unwrap()
-                        .mods
-                        .iter_mut()
-                        .any(|mc| f(mc, Some(enabled))),
+        let prof = self.profiles.get_mut(profile).unwrap();
+        // Collect group names first to avoid borrow issues
+        let group_names: Vec<_> = prof.mods.iter().filter_map(|m| {
+            if let ModOrGroup::Group { group_name, .. } = m {
+                Some(group_name.clone())
+            } else {
+                None
+            }
+        }).collect();
+        
+        // Check individual mods
+        for m in &mut prof.mods {
+            if let ModOrGroup::Individual(mc) = m {
+                if f(mc, None) {
+                    return true;
                 }
-            })
+            }
+        }
+        
+        // Check group mods (need to get enabled state from mods vec)
+        for group_name in group_names {
+            let enabled = prof.mods.iter_mut().find_map(|m| {
+                if let ModOrGroup::Group { group_name: gn, enabled } = m {
+                    if gn == &group_name { Some(enabled) } else { None }
+                } else {
+                    None
+                }
+            });
+            
+            if let Some(enabled) = enabled {
+                if let Some(group) = prof.groups.get_mut(&group_name) {
+                    for mc in &mut group.mods {
+                        if f(mc, Some(enabled)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 }
 
@@ -228,9 +312,7 @@ impl Default for ModData!["0.1.0"] {
             profiles: [("default".to_string(), Default::default())]
                 .into_iter()
                 .collect(),
-            groups: [("default".to_string(), Default::default())]
-                .into_iter()
-                .collect(),
+            groups: BTreeMap::default(),
         }
     }
 }
@@ -257,6 +339,48 @@ impl From<ModData!["0.0.0"]> for ModData!["0.1.0"] {
     }
 }
 
+impl From<ModData!["0.1.0"]> for ModData!["0.2.0"] {
+    fn from(legacy: ModData!["0.1.0"]) -> Self {
+        // Migrate global groups into per-profile groups
+        // Each profile gets a copy of the groups it references
+        let mut new_profiles = BTreeMap::new();
+        
+        for (name, profile) in legacy.profiles {
+            // Find which groups this profile references
+            let mut profile_groups = BTreeMap::new();
+            for item in &profile.mods {
+                if let ModOrGroup::Group { group_name, .. } = item {
+                    if let Some(group) = legacy.groups.get(group_name) {
+                        profile_groups.insert(group_name.clone(), group.clone());
+                    }
+                }
+            }
+            
+            let new_profile = ModProfile_v0_2_0 {
+                mods: profile.mods,
+                groups: profile_groups,
+            };
+            new_profiles.insert(name, new_profile);
+        }
+
+        Self {
+            active_profile: legacy.active_profile,
+            profiles: new_profiles,
+        }
+    }
+}
+
+impl Default for ModData!["0.2.0"] {
+    fn default() -> Self {
+        Self {
+            active_profile: "default".to_string(),
+            profiles: [("default".to_string(), Default::default())]
+                .into_iter()
+                .collect(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "version")]
 pub enum VersionAnnotatedModData {
@@ -264,6 +388,8 @@ pub enum VersionAnnotatedModData {
     V0_0_0(ModData!["0.0.0"]),
     #[serde(rename = "0.1.0")]
     V0_1_0(ModData!["0.1.0"]),
+    #[serde(rename = "0.2.0")]
+    V0_2_0(ModData!["0.2.0"]),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -292,17 +418,18 @@ impl Default for MaybeVersionedModData {
 
 impl Default for VersionAnnotatedModData {
     fn default() -> Self {
-        VersionAnnotatedModData::V0_1_0(Default::default())
+        VersionAnnotatedModData::V0_2_0(Default::default())
     }
 }
 
 impl Deref for VersionAnnotatedModData {
-    type Target = ModData!["0.1.0"];
+    type Target = ModData!["0.2.0"];
 
     fn deref(&self) -> &Self::Target {
         match self {
             VersionAnnotatedModData::V0_0_0(_) => unreachable!(),
-            VersionAnnotatedModData::V0_1_0(md) => md,
+            VersionAnnotatedModData::V0_1_0(_) => unreachable!(),
+            VersionAnnotatedModData::V0_2_0(md) => md,
         }
     }
 }
@@ -311,17 +438,18 @@ impl DerefMut for VersionAnnotatedModData {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match self {
             VersionAnnotatedModData::V0_0_0(_) => unreachable!(),
-            VersionAnnotatedModData::V0_1_0(md) => md,
+            VersionAnnotatedModData::V0_1_0(_) => unreachable!(),
+            VersionAnnotatedModData::V0_2_0(md) => md,
         }
     }
 }
 
-impl ModData!["0.1.0"] {
-    pub fn get_active_profile(&self) -> &ModProfile!["0.1.0"] {
+impl ModData!["0.2.0"] {
+    pub fn get_active_profile(&self) -> &ModProfile!["0.2.0"] {
         &self.profiles[&self.active_profile]
     }
 
-    pub fn get_active_profile_mut(&mut self) -> &mut ModProfile!["0.1.0"] {
+    pub fn get_active_profile_mut(&mut self) -> &mut ModProfile!["0.2.0"] {
         self.profiles.get_mut(&self.active_profile).unwrap()
     }
 
@@ -537,10 +665,22 @@ fn read_mod_data_or_default(
     };
 
     let mod_data = match mod_data {
-        MaybeVersionedModData::Legacy(legacy) => VersionAnnotatedModData::V0_1_0(legacy.into()),
+        MaybeVersionedModData::Legacy(legacy) => {
+            // 0.0.0 -> 0.1.0 -> 0.2.0
+            let v0_1_0: ModData_v0_1_0 = legacy.into();
+            VersionAnnotatedModData::V0_2_0(v0_1_0.into())
+        }
         MaybeVersionedModData::Versioned(v) => match v {
-            VersionAnnotatedModData::V0_0_0(md) => VersionAnnotatedModData::V0_1_0(md.into()),
-            VersionAnnotatedModData::V0_1_0(md) => VersionAnnotatedModData::V0_1_0(md),
+            VersionAnnotatedModData::V0_0_0(md) => {
+                // 0.0.0 -> 0.1.0 -> 0.2.0
+                let v0_1_0: ModData_v0_1_0 = md.into();
+                VersionAnnotatedModData::V0_2_0(v0_1_0.into())
+            }
+            VersionAnnotatedModData::V0_1_0(md) => {
+                // 0.1.0 -> 0.2.0
+                VersionAnnotatedModData::V0_2_0(md.into())
+            }
+            VersionAnnotatedModData::V0_2_0(md) => VersionAnnotatedModData::V0_2_0(md),
         },
     };
 
