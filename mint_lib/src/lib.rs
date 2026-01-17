@@ -16,7 +16,7 @@ pub mod built_info {
     include!(concat!(env!("OUT_DIR"), "/built.rs"));
 
     pub fn version() -> &'static str {
-        GIT_VERSION.unwrap()
+        GIT_VERSION.unwrap_or(PKG_VERSION)
     }
 }
 

@@ -1,215 +1,247 @@
-pub mod error;
-pub mod mod_info;
-pub mod update;
+#![feature(if_let_guard)]
 
+pub mod gui;
+pub mod integrate;
+pub mod mod_lints;
+pub mod providers;
+pub mod state;
+
+use std::ops::Deref;
 use std::{
-    io::BufWriter,
+    collections::HashSet,
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, bail};
+use directories::ProjectDirs;
 use fs_err as fs;
+use integrate::IntegrationError;
+use providers::{ModResolution, ModSpecification, ProviderError, ProviderFactory};
+use snafu::prelude::*;
+use state::{State, StateError};
 use tracing::*;
-use tracing_subscriber::fmt::format::FmtSpan;
 
-pub mod built_info {
-    include!(concat!(env!("OUT_DIR"), "/built.rs"));
-
-    pub fn version() -> &'static str {
-        GIT_VERSION.unwrap_or(PKG_VERSION)
-    }
+#[derive(Debug, Snafu)]
+pub enum MintError {
+    #[snafu(transparent)]
+    IoError { source: std::io::Error },
+    #[snafu(transparent)]
+    RepakError { source: repak::Error },
+    #[snafu(transparent)]
+    ProviderError { source: ProviderError },
+    #[snafu(transparent)]
+    IntegrationError { source: IntegrationError },
+    #[snafu(transparent)]
+    GenericError {
+        source: mint_lib::error::GenericError,
+    },
+    #[snafu(transparent)]
+    StateError { source: StateError },
+    #[snafu(display("invalid DRG pak path: {path}"))]
+    InvalidDrgPak { path: String },
 }
 
 #[derive(Debug)]
-pub enum DRGInstallationType {
-    Steam,
-    Xbox,
+pub struct Dirs {
+    pub config_dir: PathBuf,
+    pub cache_dir: PathBuf,
+    pub data_dir: PathBuf,
 }
 
-impl DRGInstallationType {
-    pub fn from_exe_path() -> Result<Self> {
-        let exe_name = std::env::current_exe()
-            .context("could not determine running exe")?
-            .file_name()
-            .context("failed to get exe path")?
-            .to_string_lossy()
-            .to_lowercase();
-        Ok(match exe_name.as_str() {
-            "fsd-win64-shipping.exe" => Self::Steam,
-            "fsd-wingdk-shipping.exe" => Self::Xbox,
-            _ => bail!("unrecognized exe file name: {exe_name}"),
-        })
-    }
-}
+impl Dirs {
+    pub fn default_xdg() -> Result<Self, MintError> {
+        let legacy_dirs = ProjectDirs::from("", "", "drg-mod-integration")
+            .expect("failed to construct project dirs");
 
-impl DRGInstallationType {
-    pub fn from_pak_path<P: AsRef<Path>>(pak: P) -> Result<Self> {
-        let pak_name = pak
-            .as_ref()
-            .file_name()
-            .context("failed to get pak file name")?
-            .to_string_lossy()
-            .to_lowercase();
-        Ok(match pak_name.as_str() {
-            "fsd-windowsnoeditor.pak" => Self::Steam,
-            "fsd-wingdk.pak" => Self::Xbox,
-            _ => bail!("unrecognized pak file name: {pak_name}"),
-        })
-    }
-    pub fn binaries_directory_name(&self) -> &'static str {
-        match self {
-            Self::Steam => "Win64",
-            Self::Xbox => "WinGDK",
-        }
-    }
-    pub fn main_pak_name(&self) -> &'static str {
-        match self {
-            Self::Steam => "FSD-WindowsNoEditor.pak",
-            Self::Xbox => "FSD-WinGDK.pak",
-        }
-    }
-    pub fn hook_dll_name(&self) -> &'static str {
-        match self {
-            Self::Steam => "x3daudio1_7.dll",
-            Self::Xbox => "d3d9.dll",
-        }
-    }
-}
+        let project_dirs =
+            ProjectDirs::from("", "", "mint").expect("failed to construct project dirs");
 
-#[derive(Debug)]
-pub struct DRGInstallation {
-    pub root: PathBuf,
-    pub installation_type: DRGInstallationType,
-}
-
-impl DRGInstallation {
-    /// Returns first DRG installation found. Only supports Steam version
-    /// TODO locate Xbox version
-    pub fn find() -> Option<Self> {
-        steamlocate::SteamDir::locate()
-            .ok()
-            .and_then(|steamdir| {
-                steamdir
-                    .find_app(548430)
-                    .ok()
-                    .flatten()
-                    .map(|(app, library)| {
-                        library
-                            .resolve_app_dir(&app)
-                            .join("FSD/Content/Paks/FSD-WindowsNoEditor.pak")
-                    })
-            })
-            .and_then(|path| Self::from_pak_path(path).ok())
+        Self::from_paths(
+            Some(legacy_dirs.config_dir())
+                .filter(|p| p.exists())
+                .unwrap_or(project_dirs.config_dir()),
+            Some(legacy_dirs.cache_dir())
+                .filter(|p| p.exists())
+                .unwrap_or(project_dirs.cache_dir()),
+            Some(legacy_dirs.data_dir())
+                .filter(|p| p.exists())
+                .unwrap_or(project_dirs.data_dir()),
+        )
     }
-    pub fn from_pak_path<P: AsRef<Path>>(pak: P) -> Result<Self> {
-        let root = pak
-            .as_ref()
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::parent)
-            .context("failed to get pak parent directory")?
-            .to_path_buf();
+
+    pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self, MintError> {
+        Self::from_paths(
+            path.as_ref().join("config"),
+            path.as_ref().join("cache"),
+            path.as_ref().join("data"),
+        )
+    }
+
+    fn from_paths<P: AsRef<Path>>(
+        config_dir: P,
+        cache_dir: P,
+        data_dir: P,
+    ) -> Result<Self, MintError> {
+        fs::create_dir_all(&config_dir)?;
+        fs::create_dir_all(&cache_dir)?;
+        fs::create_dir_all(&data_dir)?;
+
         Ok(Self {
-            root,
-            installation_type: DRGInstallationType::from_pak_path(pak)?,
+            config_dir: config_dir.as_ref().to_path_buf(),
+            cache_dir: cache_dir.as_ref().to_path_buf(),
+            data_dir: data_dir.as_ref().to_path_buf(),
         })
     }
-    pub fn binaries_directory(&self) -> PathBuf {
-        self.root
-            .join("Binaries")
-            .join(self.installation_type.binaries_directory_name())
+}
+
+pub fn is_drg_pak<P: AsRef<Path>>(path: P) -> Result<(), MintError> {
+    let mut reader = std::io::BufReader::new(fs::File::open(path.as_ref())?);
+    let pak = repak::PakBuilder::new().reader(&mut reader)?;
+    pak.get("FSD/FSD.uproject", &mut reader)?;
+    Ok(())
+}
+
+pub async fn resolve_unordered_and_integrate<P: AsRef<Path>>(
+    game_path: P,
+    state: &State,
+    mod_specs: &[ModSpecification],
+    update: bool,
+) -> Result<(), IntegrationError> {
+    let mods = state.store.resolve_mods(mod_specs, update).await?;
+
+    let mods_set = mod_specs
+        .iter()
+        .flat_map(|m| [&mods[m].spec.url, &mods[m].resolution.url.0])
+        .collect::<HashSet<_>>();
+
+    // TODO need more rebust way of detecting whether dependencies are missing
+    let missing_deps = mod_specs
+        .iter()
+        .flat_map(|m| {
+            mods[m]
+                .suggested_dependencies
+                .iter()
+                .filter_map(|m| (!mods_set.contains(&m.url)).then_some(&m.url))
+        })
+        .collect::<HashSet<_>>();
+    if !missing_deps.is_empty() {
+        warn!("the following dependencies are missing:");
+        for d in missing_deps {
+            warn!("  {d}");
+        }
     }
-    pub fn paks_path(&self) -> PathBuf {
-        self.root.join("Content").join("Paks")
+
+    let to_integrate = mod_specs
+        .iter()
+        .map(|u| mods[u].clone())
+        .collect::<Vec<_>>();
+    let urls = to_integrate
+        .iter()
+        .map(|m| &m.resolution)
+        .collect::<Vec<_>>();
+
+    info!("fetching mods...");
+    let paths = state.store.fetch_mods(&urls, update, None).await?;
+
+    integrate::integrate(
+        game_path,
+        state.config.deref().into(),
+        to_integrate.into_iter().zip(paths).collect(),
+    )
+}
+
+async fn resolve_into_urls(
+    state: &State,
+    mod_specs: &[ModSpecification],
+) -> Result<Vec<ModResolution>, MintError> {
+    let mods = state.store.resolve_mods(mod_specs, false).await?;
+
+    let mods_set = mod_specs
+        .iter()
+        .flat_map(|m| [&mods[m].spec.url, &mods[m].resolution.url.0])
+        .collect::<HashSet<_>>();
+
+    // TODO need more rebust way of detecting whether dependencies are missing
+    let missing_deps = mod_specs
+        .iter()
+        .flat_map(|m| {
+            mods[m]
+                .suggested_dependencies
+                .iter()
+                .filter_map(|m| (!mods_set.contains(&m.url)).then_some(&m.url))
+        })
+        .collect::<HashSet<_>>();
+    if !missing_deps.is_empty() {
+        warn!("the following dependencies are missing:");
+        for d in missing_deps {
+            warn!("  {d}");
+        }
     }
-    pub fn main_pak(&self) -> PathBuf {
-        self.root
-            .join("Content")
-            .join("Paks")
-            .join(self.installation_type.main_pak_name())
-    }
-    pub fn modio_directory(&self) -> Option<PathBuf> {
-        match self.installation_type {
-            DRGInstallationType::Steam => {
-                #[cfg(target_os = "windows")]
-                {
-                    Some(PathBuf::from("C:\\Users\\Public\\mod.io\\2475"))
-                }
-                #[cfg(target_os = "linux")]
-                {
-                    steamlocate::SteamDir::locate()
-                        .map(|s| {
-                            s.path().join(
-                                "steamapps/compatdata/548430/pfx/drive_c/users/Public/mod.io/2475",
-                            )
-                        })
-                        .ok()
-                }
-                #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-                {
-                    None // TODO
-                }
+
+    let urls = mod_specs
+        .iter()
+        .map(|u| mods[u].clone())
+        .map(|m| m.resolution)
+        .collect::<Vec<_>>();
+
+    Ok(urls)
+}
+
+pub async fn resolve_ordered(
+    state: &State,
+    mod_specs: &[ModSpecification],
+) -> Result<Vec<PathBuf>, MintError> {
+    let urls = resolve_into_urls(state, mod_specs).await?;
+    Ok(state
+        .store
+        .fetch_mods(&urls.iter().collect::<Vec<_>>(), false, None)
+        .await?)
+}
+
+pub async fn resolve_unordered_and_integrate_with_provider_init<P, F>(
+    game_path: P,
+    state: &mut State,
+    mod_specs: &[ModSpecification],
+    update: bool,
+    init: F,
+) -> Result<(), MintError>
+where
+    P: AsRef<Path>,
+    F: Fn(&mut State, String, &ProviderFactory) -> Result<(), MintError>,
+{
+    loop {
+        match resolve_unordered_and_integrate(&game_path, state, mod_specs, update).await {
+            Ok(()) => return Ok(()),
+            Err(ref e)
+                if let IntegrationError::ProviderError { source } = e
+                    && let ProviderError::NoProvider { url, factory } = source =>
+            {
+                init(state, url.clone(), factory)?
             }
-            DRGInstallationType::Xbox => None,
+            Err(e) => Err(e)?,
         }
     }
 }
 
-pub fn setup_logging<P: AsRef<Path>>(
-    log_path: P,
-    target: &str,
-) -> Result<tracing_appender::non_blocking::WorkerGuard> {
-    use tracing::metadata::LevelFilter;
-    use tracing_subscriber::prelude::*;
-    use tracing_subscriber::{
-        EnvFilter,
-        field::RecordFields,
-        filter,
-        fmt::{
-            self, FormatFields,
-            format::{Pretty, Writer},
-        },
-    };
-
-    /// Workaround for <https://github.com/tokio-rs/tracing/issues/1817>.
-    struct NewType(Pretty);
-
-    impl<'writer> FormatFields<'writer> for NewType {
-        fn format_fields<R: RecordFields>(
-            &self,
-            writer: Writer<'writer>,
-            fields: R,
-        ) -> core::fmt::Result {
-            self.0.format_fields(writer, fields)
+#[allow(clippy::needless_pass_by_ref_mut)]
+pub async fn resolve_ordered_with_provider_init<F>(
+    state: &mut State,
+    mod_specs: &[ModSpecification],
+    init: F,
+) -> Result<Vec<PathBuf>, MintError>
+where
+    F: Fn(&mut State, String, &ProviderFactory) -> Result<(), MintError>,
+{
+    loop {
+        match resolve_ordered(state, mod_specs).await {
+            Ok(mod_paths) => return Ok(mod_paths),
+            Err(ref e)
+                if let MintError::IntegrationError { source } = e
+                    && let IntegrationError::ProviderError { source } = source
+                    && let ProviderError::NoProvider { url, factory } = source =>
+            {
+                init(state, url.clone(), factory)?
+            }
+            Err(e) => Err(e)?,
         }
     }
-
-    let f = fs::File::create(log_path.as_ref())?;
-    let writer = BufWriter::new(f);
-    let (log_file_appender, guard) = tracing_appender::non_blocking(writer);
-    let debug_file_log = fmt::layer()
-        .with_writer(log_file_appender)
-        .fmt_fields(NewType(Pretty::default()))
-        .with_ansi(false)
-        .with_filter(filter::Targets::new().with_target(target, Level::DEBUG));
-    let stderr_log = fmt::layer()
-        .with_writer(std::io::stderr)
-        .event_format(tracing_subscriber::fmt::format().without_time())
-        .with_span_events(FmtSpan::CLOSE)
-        .with_filter(
-            EnvFilter::builder()
-                .with_default_directive(LevelFilter::INFO.into())
-                .from_env_lossy(),
-        );
-    let subscriber = tracing_subscriber::registry()
-        .with(stderr_log)
-        .with(debug_file_log);
-
-    tracing::subscriber::set_global_default(subscriber)?;
-
-    debug!("tracing subscriber setup");
-    info!("writing logs to {:?}", log_path.as_ref().display());
-    info!("version: {}", built_info::version());
-
-    Ok(guard)
 }
