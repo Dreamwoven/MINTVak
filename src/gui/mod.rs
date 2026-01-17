@@ -24,7 +24,6 @@ use eframe::{
     epaint::{Color32, Stroke, text::LayoutJob},
 };
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
-use itertools::Itertools as _;
 use mint_lib::error::ResultExt as _;
 use mint_lib::mod_info::{ModioTags, RequiredStatus};
 use mint_lib::update::GitHubRelease;
@@ -307,6 +306,13 @@ impl App {
             rename_folder: None,
         };
 
+        // Unique identifier for a mod's location (for duplicate detection)
+        #[derive(Clone, PartialEq, Eq)]
+        enum ModLocation {
+            Root(usize),                    // index in profile.mods
+            InFolder(String, usize),        // (folder_name, index within folder)
+        }
+
         let ui_profile = |ui: &mut Ui, profile: &mut ModProfile| {
             let enabled_specs = profile
                 .mods
@@ -315,22 +321,29 @@ impl App {
                 .flat_map(|(i, m)| -> Box<dyn Iterator<Item = _>> {
                     match m {
                         ModOrGroup::Individual(mc) => {
-                            Box::new(mc.enabled.then_some((Some(i), mc.spec.clone())).into_iter())
+                            Box::new(mc.enabled.then_some((ModLocation::Root(i), mc.spec.clone())).into_iter())
                         }
                         ModOrGroup::Group {
                             group_name,
                             enabled,
-                        } => Box::new(
-                            enabled
-                                .then(|| profile.groups.get(group_name))
-                                .flatten()
-                                .into_iter()
-                                .flat_map(|g| {
-                                    g.mods
-                                        .iter()
-                                        .filter_map(|m| m.enabled.then_some((None, m.spec.clone())))
-                                }),
-                        ),
+                        } => {
+                            let folder_name = group_name.clone();
+                            Box::new(
+                                enabled
+                                    .then(|| profile.groups.get(group_name))
+                                    .flatten()
+                                    .into_iter()
+                                    .flat_map(move |g| {
+                                        let folder_name = folder_name.clone();
+                                        g.mods
+                                            .iter()
+                                            .enumerate()
+                                            .filter_map(move |(idx, m)| {
+                                                m.enabled.then_some((ModLocation::InFolder(folder_name.clone(), idx), m.spec.clone()))
+                                            })
+                                    }),
+                            )
+                        }
                     }
                 })
                 .collect::<Vec<_>>();
@@ -458,10 +471,15 @@ impl App {
 
             let mut ui_mod = |ctx: &mut Ctx,
                               ui: &mut Ui,
-                              in_folder: Option<&str>,
-                              row_index: usize,
+                              mod_location: ModLocation,
                               mc: &mut ModConfig,
                               override_priority: Option<i32>| {
+                // Extract row_index for move operations (only valid for root mods)
+                let root_index = match &mod_location {
+                    ModLocation::Root(idx) => Some(*idx),
+                    ModLocation::InFolder(_, _) => None,
+                };
+                
                 if !mc.enabled {
                     let vis = ui.visuals_mut();
                     vis.override_text_color = Some(vis.text_color());
@@ -477,19 +495,21 @@ impl App {
                 }
 
                 // Move to folder dropdown (only for mods at root level)
-                if in_folder.is_none() && !folder_names.is_empty() {
-                    egui::ComboBox::from_id_salt(format!("move-to-folder-{}", row_index))
-                        .selected_text("📁")
-                        .width(40.0)
-                        .show_ui(ui, |ui| {
-                            for folder_name in &folder_names {
-                                if ui.selectable_label(false, folder_name).clicked() {
-                                    ctx.move_mod_to_folder = Some((row_index, folder_name.clone()));
+                if let Some(row_index) = root_index {
+                    if !folder_names.is_empty() {
+                        egui::ComboBox::from_id_salt(format!("move-to-folder-{}", row_index))
+                            .selected_text("📁")
+                            .width(40.0)
+                            .show_ui(ui, |ui| {
+                                for folder_name in &folder_names {
+                                    if ui.selectable_label(false, folder_name).clicked() {
+                                        ctx.move_mod_to_folder = Some((row_index, folder_name.clone()));
+                                    }
                                 }
-                            }
-                        })
-                        .response
-                        .on_hover_text("Move to folder");
+                            })
+                            .response
+                            .on_hover_text("Move to folder");
+                    }
                 }
 
                 /*
@@ -533,7 +553,12 @@ impl App {
                 }
 
                 if let Some(info) = &info {
-                    egui::ComboBox::from_id_salt(row_index)
+                    // Create a unique ID based on mod location
+                    let combo_id = match &mod_location {
+                        ModLocation::Root(idx) => format!("version-root-{}", idx),
+                        ModLocation::InFolder(folder, idx) => format!("version-{}-{}", folder, idx),
+                    };
+                    egui::ComboBox::from_id_salt(combo_id)
                         .selected_text(
                             self.state
                                 .store
@@ -632,8 +657,8 @@ impl App {
                     }
 
                     if mc.enabled {
-                        let is_duplicate = enabled_specs.iter().any(|(i, spec)| {
-                            Some(row_index) != *i && info.spec.satisfies_dependency(spec)
+                        let is_duplicate = enabled_specs.iter().any(|(loc, spec)| {
+                            *loc != mod_location && info.spec.satisfies_dependency(spec)
                         });
                         if is_duplicate
                             && ui
@@ -644,7 +669,10 @@ impl App {
                                 .on_hover_text_at_pointer("remove duplicate")
                                 .clicked()
                         {
-                            ctx.pending_delete = Some((info.name.clone(), row_index));
+                            // For deletion, we need the root index (duplicates in folders handled differently)
+                            if let Some(idx) = root_index {
+                                ctx.pending_delete = Some((info.name.clone(), idx));
+                            }
                         }
 
                         let missing_deps = info
@@ -713,7 +741,33 @@ impl App {
                         }
                     });
 
-                    let res = ui.hyperlink_to(search.job, &mc.spec.url);
+                    // For local files, clicking opens the containing folder
+                    // For URLs, clicking opens in browser
+                    let res = if info.provider == "file" {
+                        let label = egui::Label::new(search.job).sense(egui::Sense::click());
+                        let res = ui.add(label);
+                        
+                        // Draw underline only on hover to match hyperlink behavior
+                        if res.hovered() {
+                            let rect = res.rect;
+                            let underline_y = rect.bottom() - 1.0;
+                            ui.painter().line_segment(
+                                [egui::pos2(rect.left(), underline_y), egui::pos2(rect.right(), underline_y)],
+                                egui::Stroke::new(1.0, ui.visuals().hyperlink_color),
+                            );
+                        }
+                        
+                        if res.clicked() {
+                            // Open the parent directory of the file
+                            if let Some(parent) = std::path::Path::new(&mc.spec.url).parent() {
+                                opener::open(parent).ok();
+                            }
+                        }
+                        res.on_hover_text_at_pointer("Click to open containing folder")
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    } else {
+                        ui.hyperlink_to(search.job, &mc.spec.url)
+                    };
                     if search.is_match && self.scroll_to_match {
                         res.scroll_to_me(None);
                         ctx.scroll_to_match = false;
@@ -738,7 +792,35 @@ impl App {
                         }
                     });
 
-                    let res = ui.hyperlink_to(search.job, &mc.spec.url);
+                    // Detect if this is a local file path (not a URL)
+                    let is_local_file = !mc.spec.url.starts_with("http://") 
+                        && !mc.spec.url.starts_with("https://")
+                        && std::path::Path::new(&mc.spec.url).exists();
+                    
+                    let res = if is_local_file {
+                        let label = egui::Label::new(search.job).sense(egui::Sense::click());
+                        let res = ui.add(label);
+                        
+                        // Draw underline only on hover to match hyperlink behavior
+                        if res.hovered() {
+                            let rect = res.rect;
+                            let underline_y = rect.bottom() - 1.0;
+                            ui.painter().line_segment(
+                                [egui::pos2(rect.left(), underline_y), egui::pos2(rect.right(), underline_y)],
+                                egui::Stroke::new(1.0, ui.visuals().hyperlink_color),
+                            );
+                        }
+                        
+                        if res.clicked() {
+                            if let Some(parent) = std::path::Path::new(&mc.spec.url).parent() {
+                                opener::open(parent).ok();
+                            }
+                        }
+                        res.on_hover_text_at_pointer("Click to open containing folder")
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    } else {
+                        ui.hyperlink_to(search.job, &mc.spec.url)
+                    };
                     if search.is_match && self.scroll_to_match {
                         res.scroll_to_me(None);
                         ctx.scroll_to_match = false;
@@ -772,7 +854,7 @@ impl App {
 
                     match mc {
                         ModOrGroup::Individual(mc) => {
-                            ui_mod(ctx, ui, None, row_index, mc, None);
+                            ui_mod(ctx, ui, ModLocation::Root(row_index), mc, None);
                         }
                         ModOrGroup::Group {
                             group_name,
@@ -797,16 +879,28 @@ impl App {
                             // Check if this folder should be opened (e.g., after moving a mod into it)
                             let should_open = self.expand_folder.as_ref() == Some(group_name);
                             
-                            // Use open() to force-open when a mod was just moved in
-                            let mut header = egui::CollapsingHeader::new(group_name.as_str())
+                            // Check if folder name matches search - if so, also expand it
+                            let folder_matches_search = !self.search_string.is_empty() 
+                                && group_name.to_lowercase().contains(&self.search_string.to_lowercase());
+                            
+                            // Create searchable folder name for highlighting
+                            let folder_label = searchable_text(group_name.as_str(), &self.search_string, {
+                                TextFormat {
+                                    color: ui.visuals().hyperlink_color,
+                                    ..Default::default()
+                                }
+                            });
+                            
+                            // Use open() to force-open when a mod was just moved in or when folder name matches search
+                            let mut header = egui::CollapsingHeader::new(folder_label.job)
                                 .id_salt(folder_id)
                                 .default_open(false);
                             
-                            if should_open {
+                            if should_open || folder_matches_search {
                                 header = header.open(Some(true));
                             }
                             
-                            header.show(ui, |ui| {
+                            let header_response = header.show(ui, |ui| {
                                     if let Some(group) = profile.groups.get_mut(&group_name_clone) {
                                         // Folder priority override controls
                                         ui.horizontal(|ui| {
@@ -872,7 +966,7 @@ impl App {
                                                     .response
                                                     .on_hover_text("Move to...");
                                                 
-                                                ui_mod(ctx, ui, Some(&group_name_clone), index, m, override_priority);
+                                                ui_mod(ctx, ui, ModLocation::InFolder(group_name_clone.clone(), index), m, override_priority);
                                             });
                                         }
                                         if let Some(idx) = move_out_index {
@@ -883,43 +977,79 @@ impl App {
                                         }
                                         if let Some(idx) = delete_mod_index {
                                             // Get mod name for confirmation
-                                            if let Some(m) = group.mods.get(idx) {
+                                            if group.mods.get(idx).is_some() {
                                                 ctx.pending_folder_mod_delete = Some((group_name_clone.clone(), idx));
                                             }
                                         }
                                     }
                                 });
+                            
+                            // Scroll to folder if it matches the search
+                            if folder_matches_search && self.scroll_to_match {
+                                header_response.header_response.scroll_to_me(None);
+                                ctx.scroll_to_match = false;
+                            }
                         }
                     }
                 };
 
             if let Some(sorting_config) = sorting_config {
                 let comp = sort_mods(sorting_config);
-                profile
-                    .mods
-                    .iter_mut()
-                    .map(|m| {
-                        // fetch ModInfo up front because doing it in the comparator is slow
-                        let ModOrGroup::Individual(mc) = m else {
-                            unimplemented!("Item is not Individual \n{:?}", m);
-                        };
-                        let info = self.state.store.get_mod_info(&mc.spec);
-                        (m, info)
-                    })
+                
+                // Collect indices and info for folders and individuals separately
+                let folder_indices: Vec<usize> = profile.mods.iter()
                     .enumerate()
-                    .sorted_by(|a, b| comp((a.1.0, a.1.1.as_ref()), (b.1.0, b.1.1.as_ref())))
+                    .filter(|(_, m)| matches!(m, ModOrGroup::Group { .. }))
+                    .map(|(i, _)| i)
+                    .collect();
+                
+                let mut individual_data: Vec<(usize, Option<ModInfo>)> = profile.mods.iter()
                     .enumerate()
-                    .for_each(|(visual_index, (store_index, item))| {
-                        let mut frame = egui::Frame::NONE;
-                        if visual_index % 2 == 1 {
-                            frame.fill = ui.visuals().faint_bg_color
+                    .filter_map(|(i, m)| {
+                        if let ModOrGroup::Individual(mc) = m {
+                            let info = self.state.store.get_mod_info(&mc.spec);
+                            Some((i, info))
+                        } else {
+                            None
                         }
-                        frame.show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui_item(&mut ctx, ui, item.0, store_index);
-                            });
+                    })
+                    .collect();
+                
+                // Sort the individual mods by comparing their data
+                individual_data.sort_by(|(idx_a, info_a), (idx_b, info_b)| {
+                    let a = &profile.mods[*idx_a];
+                    let b = &profile.mods[*idx_b];
+                    comp((a, info_a.as_ref()), (b, info_b.as_ref()))
+                });
+                
+                // Display folders first (unsorted, original order)
+                let mut visual_index = 0;
+                for store_index in &folder_indices {
+                    let mut frame = egui::Frame::NONE;
+                    if visual_index % 2 == 1 {
+                        frame.fill = ui.visuals().faint_bg_color
+                    }
+                    frame.show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui_item(&mut ctx, ui, &mut profile.mods[*store_index], *store_index);
                         });
                     });
+                    visual_index += 1;
+                }
+                
+                // Display sorted individual mods
+                for (store_index, _info) in &individual_data {
+                    let mut frame = egui::Frame::NONE;
+                    if visual_index % 2 == 1 {
+                        frame.fill = ui.visuals().faint_bg_color
+                    }
+                    frame.show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui_item(&mut ctx, ui, &mut profile.mods[*store_index], *store_index);
+                        });
+                    });
+                    visual_index += 1;
+                }
             } else {
                 let res = egui_dnd::dnd(ui, ui.id())
                     .with_mouse_config(egui_dnd::DragDropConfig::mouse())
@@ -1084,7 +1214,11 @@ impl App {
             .lines()
             .map(|l| l.trim())
             .filter(|l| !l.is_empty())
-            .map(|l| ModSpecification::new(l.to_string()))
+            .map(|l| {
+                // Strip URL fragment (e.g., "#description" from mod.io URLs)
+                let url = l.split('#').next().unwrap_or(l);
+                ModSpecification::new(url.to_string())
+            })
             .collect()
     }
 
@@ -1724,8 +1858,10 @@ impl App {
                     mods: vec![],
                     priority_override: None,
                 });
-                // Add group reference to profile's mods list
-                profile.mods.push(ModOrGroup::Group { group_name: folder_name, enabled: true });
+                // Add group reference to profile's mods list (at the top)
+                profile.mods.insert(0, ModOrGroup::Group { group_name: folder_name.clone(), enabled: true });
+                // Expand the newly created folder so user can see it
+                self.expand_folder = Some(folder_name);
             }
             self.state.mod_data.save().unwrap();
         }
@@ -2261,8 +2397,9 @@ impl App {
 type ModListEntry<'a> = (&'a ModOrGroup, Option<&'a ModInfo>);
 fn sort_mods(config: SortingConfig) -> impl Fn(ModListEntry, ModListEntry) -> Ordering {
     move |(a, info_a), (b, info_b)| {
+        // Groups should not reach here, but handle gracefully if they do
         if matches!(a, ModOrGroup::Group { .. }) || matches!(b, ModOrGroup::Group { .. }) {
-            unimplemented!("Groups in sorting not implemented");
+            return Ordering::Equal;
         }
 
         let ModOrGroup::Individual(mc_a) = a else {
@@ -2698,34 +2835,55 @@ impl eframe::App for App {
             let profile = self.state.mod_data.active_profile.clone();
 
             ui.horizontal(|ui| {
-                ui.label("Sort by: ");
-
                 let (mut sort_category, mut is_ascending) = self
                     .get_sorting_config()
                     .map(|c| (Some(c.sort_category), c.is_ascending))
                     .unwrap_or_default();
 
-                let mut clicked = ui.radio_value(&mut sort_category, None, "Manual").clicked();
-                for category in SortBy::iter() {
-                    let mut radio_label = category.as_str().to_owned();
-                    if sort_category == Some(category) {
-                        radio_label.push_str(if is_ascending { " ⏶" } else { " ⏷" });
+                // Build display text for current selection
+                let current_text = match sort_category {
+                    None => "Manual".to_string(),
+                    Some(cat) => {
+                        let arrow = if is_ascending { " ⏶" } else { " ⏷" };
+                        format!("{}{}", cat.as_str(), arrow)
                     }
-                    let resp = ui.radio_value(&mut sort_category, Some(category), radio_label);
-                    if resp.clicked() {
-                        clicked = true;
-                        if resp.changed() {
-                            is_ascending = true;
-                        } else {
-                            is_ascending = !is_ascending;
-                        }
-                    };
-                }
-                if clicked {
-                    self.update_sorting_config(sort_category, is_ascending);
-                }
+                };
 
-                ui.add_space(16.);
+                ui.label("Sort:");
+                egui::ComboBox::from_id_salt("sort-dropdown")
+                    .selected_text(current_text)
+                    .show_ui(ui, |ui| {
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                        // Manual option
+                        let manual_text = if sort_category.is_none() { "✓ Manual" } else { "  Manual" };
+                        if ui.button(manual_text).clicked() {
+                            sort_category = None;
+                            self.update_sorting_config(sort_category, is_ascending);
+                        }
+                        ui.separator();
+                        // Sort category options
+                        for category in SortBy::iter() {
+                            let is_selected = sort_category == Some(category);
+                            let label = if is_selected {
+                                format!("✓ {} {}", category.as_str(), if is_ascending { "⏶" } else { "⏷" })
+                            } else {
+                                format!("  {}", category.as_str())
+                            };
+                            if ui.button(label).clicked() {
+                                if is_selected {
+                                    // Toggle direction if clicking same category
+                                    is_ascending = !is_ascending;
+                                } else {
+                                    // New category, default to ascending
+                                    sort_category = Some(category);
+                                    is_ascending = true;
+                                }
+                                self.update_sorting_config(sort_category, is_ascending);
+                            }
+                        }
+                    });
+
+                ui.add_space(8.);
 
                 // Create folder button
                 if ui.button("📁+").on_hover_text("Create new folder").clicked() {
@@ -2737,13 +2895,28 @@ impl eframe::App for App {
                 // TODO: actually implement mod groups.
                 let search_string = &mut self.search_string;
                 let lower = search_string.to_lowercase();
-                let any_matches = self.state.mod_data.any_mod(&profile, |mc, _| {
+                
+                // Check if any mod names match the search
+                let any_mod_matches = self.state.mod_data.any_mod(&profile, |mc, _| {
                     self.state
                         .store
                         .get_mod_info(&mc.spec)
                         .map(|i| i.name.to_lowercase().contains(&lower))
                         .unwrap_or(false)
                 });
+                
+                // Also check if any folder names match the search
+                let any_folder_matches = if !lower.is_empty() {
+                    if let Some(prof) = self.state.mod_data.profiles.get(&profile) {
+                        prof.groups.keys().any(|folder_name| folder_name.to_lowercase().contains(&lower))
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                
+                let any_matches = any_mod_matches || any_folder_matches;
 
                 let mut text_edit = egui::TextEdit::singleline(search_string).hint_text("Search");
                 if !any_matches {
